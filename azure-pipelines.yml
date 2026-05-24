@@ -1,0 +1,140 @@
+trigger: none 
+pr: none 
+
+schedules:
+- cron: "0 7 * * *" # Runs every day at 07:00 UTC
+  displayName: Scheduled pipeline execution # friendly name given to a specific schedule
+  branches:
+    include: # which branches the schedule applies to 
+      - main
+      - qa
+  always: true
+
+variables:
+  - group: mastersaf-conector-sap-tr-login
+  - group: mastersaf-conector-sap
+
+stages:
+  - stage: GetConectorSAPVersion
+    pool:
+      vmImage: windows-latest
+
+    jobs:
+    - job: GetVersion
+      displayName: 'Get Website Version'
+      steps:
+      - task: UsePythonVersion@0
+        displayName: Install Python
+        inputs:
+          versionSpec: '3.13.x'
+          architecture: 'x64'
+          addToPath: true
+
+      - script: |
+            python -m pip install robotframework
+            python -m pip install robotframework-seleniumlibrary
+            
+            robot --version
+            python -m pip list
+            
+        displayName: 'Install Robot Framework dependencies'
+
+      - task: replacetokens@5
+        displayName: 'Replace Tokens'
+        inputs:
+          targetFiles: |
+                  **/*.robot
+                  **/SeleniumExtension.py
+          tokenPrefix: '#{'
+          tokenSuffix: '}#'
+
+      - script: |
+            mkdir d:\temp\mastersaf
+            cd $(System.DefaultWorkingDirectory)\robot_framework
+            robot GetVerstion.robot
+        displayName: 'Run Robot Framework - GetVersion'
+
+      - task: PowerShell@2
+        name: ProduceVar
+        displayName: 'Website Version'
+        inputs:
+          targetType: 'inline'
+          script: |
+              $versionTXTPath = 'd:\temp\mastersaf\Version.txt'
+             
+              if (Test-Path $versionTXTPath -PathType Leaf)
+              {
+                $version = Get-Content -Path $versionTXTPath -Raw
+
+                Write-Host $version
+                echo "##vso[task.setvariable variable=myVar;isOutput=true]$version"
+              }
+              else
+              {
+                Write-Host "Error: Version.txt NOT found!"
+                exit 1
+              }
+
+  - stage: QA_SERVER
+    dependsOn: GetConectorSAPVersion
+    condition: and (
+        succeeded(),
+        eq(variables['Build.SourceBranch'], 'refs/heads/qa')
+        )
+    pool:
+      name: QA_SERVER
+    variables:
+      ConectorSAPVersion: $[ stageDependencies.GetConectorSAPVersion.GetVersion.outputs['ProduceVar.myVar'] ]
+    jobs:
+    - job: ValidateVersion
+      displayName: "QA-Validate Version"
+      steps:
+      - task: PowerShell@2
+        name: VersionValidation
+        env:
+          FROMEMAILADDRESS: $(FromEmailAddress)
+          TOEMAILADDRESS: $(ToEmailAddresses)
+          SMTPSERVER: $(SmtpServer)
+          VERSION_FILE_PATH: $(VersionFilePath)
+          ENVIRONMENT: 'QA'
+          VERSION: $(ConectorSAPVersion)
+        inputs:
+          targetType: 'filePath'
+          filePath: '$(System.DefaultWorkingDirectory)\scripts\CheckVersionFileSendEmail.ps1'
+  
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Artifact: Artifacts'
+        inputs:
+          PathtoPublish: $(Build.ArtifactStagingDirectory)/
+          ArtifactName: drop
+
+  - stage: PRODUCTION_SERVER
+    dependsOn: GetConectorSAPVersion
+    condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+    pool:
+      name: PRODUCTION_SERVER
+    variables:
+      ConectorSAPVersion: $[ stageDependencies.GetConectorSAPVersion.GetVersion.outputs['ProduceVar.myVar'] ]
+    jobs:
+    - job: ValidateVersion
+      displayName: "PROD-Validate Version"
+      steps:
+      - task: PowerShell@2
+        name: VersionValidation
+        env:
+          FROMEMAILADDRESS: $(FromEmailAddress)
+          TOEMAILADDRESS: $(ToEmailAddresses)
+          SMTPSERVER: $(SmtpServer)
+          VERSION_FILE_PATH: $(VersionFilePath)
+          ENVIRONMENT: 'Production'
+          VERSION: $(ConectorSAPVersion)
+        inputs:
+          targetType: 'filePath'
+          filePath: '$(System.DefaultWorkingDirectory)\scripts\CheckVersionFileSendEmail.ps1'
+
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Artifact: Artifacts'
+        inputs:
+          PathtoPublish: $(Build.ArtifactStagingDirectory)/
+          ArtifactName: drop
+

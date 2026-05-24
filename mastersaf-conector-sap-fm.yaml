@@ -1,0 +1,175 @@
+trigger: none
+
+resources:
+  pipelines:
+    - pipeline: 'BuildPipeline'
+      project: 'Sales Order to Invoice'
+      source: '\PIPELINE_FOLDER\Mastersaf-ConectorSAP-Update\mastersaf-conector-sap-check-version'
+      trigger:
+        branches: 
+          include:
+            - qa
+            - main
+
+variables:
+  - name: sourceBranch
+    value: $(resources.pipeline.BuildPipeline.sourceBranch)
+
+stages:
+  - stage: setEnvironmentVariable
+    dependsOn: []
+    jobs:
+    - job: setEnvironmentVariable
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - script: |
+            echo "The pipeline was triggered by the branch: $(sourceBranch)"
+          displayName: 'Show source branch'
+
+        - pwsh: |
+            Write-Host "##vso[task.setvariable variable=EnvToRUN;isOutput=true]$(sourceBranch)"
+          name: setEnv
+          displayName: 'Set environment to run'
+
+  - stage: ValidateMastersafVersion
+    dependsOn: setEnvironmentVariable
+    displayName: Validate Mastersaf Version
+    variables:
+      - name: EnvToRUN
+        value: $[stageDependencies.setEnvironmentVariable.setEnvironmentVariable.outputs['setEnv.EnvToRUN']]
+    jobs:
+      - job: ArtifactVersionValidation
+        displayName: 'Validate Mastersaf Version'
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - template: templates/versionValidation-template.yml
+            parameters:
+              branchName: $(EnvToRUN)
+
+  - stage: DownloadTRZipFile
+    dependsOn: ValidateMastersafVersion
+    condition: eq(dependencies.ValidateMastersafVersion.outputs['ArtifactVersionValidation.VersionValidation.ArtifactValidation'], 'true')
+    displayName: Download TR Zip
+    variables:
+      - name: EnvToRUN
+        value: $[stageDependencies.setEnvironmentVariable.setEnvironmentVariable.outputs['setEnv.EnvToRUN']]
+    jobs:
+      - job: Run_Robot_FrameWork
+        pool:
+            vmImage: windows-latest
+        variables:
+          - group: mastersaf-conector-sap-tr-login
+          - group: mastersaf-conector-sap
+
+        displayName: "Download ConectorSAP"
+        steps:  
+          - task: UsePythonVersion@0
+            displayName: Install Python
+            inputs:
+              versionSpec: '3.13.x'
+              architecture: 'x64'
+              addToPath: true
+
+          - script: |
+                python -m pip install robotframework
+                python -m pip install robotframework-seleniumlibrary
+                
+                robot --version
+                python -m pip list
+                
+            displayName: 'Install Robot Framework dependencies'
+
+          - task: replacetokens@5
+            displayName: 'Replace Tokens'
+            inputs:
+              targetFiles: |
+                      **/*.robot
+                      **/SeleniumExtension.py
+              tokenPrefix: '#{'
+              tokenSuffix: '}#'
+
+          - script: |
+                mkdir d:\temp\mastersaf\
+                cd $(System.DefaultWorkingDirectory)\robot_framework
+                robot DownloadZipFile.robot
+
+                cd d:\temp\mastersaf\
+                dir
+            displayName: 'Run Robot Framework'
+
+          - task: PowerShell@2
+            name: UnzipIntegradorDFeConectorSAP
+            displayName: 'Unzip IntegradorDFeConectorSAP'
+            env:
+              SOURCE_DIR: 'd:\temp\mastersaf\'
+              DESTINATION_DIR: $(Build.ArtifactStagingDirectory)
+            inputs:
+              targetType: 'filePath'
+              filePath: '$(System.DefaultWorkingDirectory)\scripts\UnzipIntegradorDFeConectorSAP.ps1'
+          
+          - task: CopyFiles@2
+            displayName: 'Copy SAP jco files'
+            inputs:
+              SourceFolder: $(System.DefaultWorkingDirectory)/sap_dependencies_placeholder_win
+              TargetFolder: $(Build.ArtifactStagingDirectory)/ConectorSAP/lib/
+              OverWrite: true
+
+          - task: ArchiveFiles@2
+            displayName: 'Create ConectorSAP.zip'
+            inputs:
+              rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/ConectorSAP/'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/drop/ConectorSAP.zip'
+              replaceExistingArchive: true
+          
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact: Artifacts'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/drop'
+              ArtifactName: drop
+
+
+  - stage: Update_QA_SERVER
+    dependsOn: DownloadTRZipFile
+    condition: and (
+              succeeded('DownloadTRZipFile'),
+              eq(variables['build.sourceBranch'], 'refs/heads/qa'),
+              eq(dependencies.ValidateMastersafVersion.outputs['ArtifactVersionValidation.VersionValidation.ArtifactValidation'], 'true')
+            )
+    
+    jobs:
+    - template: templates/DeploySAPConnector.yaml
+      parameters:
+        sourceBranch: $(sourceBranch)
+        deployment: "Update_ConectorSAP_FM" 
+        deploymentName: "Update ConectorSAP_FM"
+        deploymentEnvironment: 'Mastersaf QA'
+        deploymentVariableGroup: 'mastersaf-conector-sap-fm-qa'
+        deploymentPool: 'QA_SERVER'
+        logEnvironment: 'QA'
+        conectorSAPName: "ConectorSAP_FM"
+        pipelineNumber: '763'
+
+  - stage: Update_PRODUCTION_SERVER
+    dependsOn: DownloadTRZipFile
+    condition: and (
+              succeeded('DownloadTRZipFile'),
+              eq(variables['build.sourceBranch'], 'refs/heads/main'),
+              eq(dependencies.ValidateMastersafVersion.outputs['ArtifactVersionValidation.VersionValidation.ArtifactValidation'], 'true')
+            )
+    
+    jobs:
+    - template: templates/DeploySAPConnector.yaml
+      parameters:
+        sourceBranch: $(sourceBranch)
+        deployment: "Update_ConectorSAP_FM" 
+        deploymentName: "Update ConectorSAP_FM"
+        deploymentEnvironment: 'Mastersaf Prod'
+        deploymentVariableGroup: 'mastersaf-conector-sap-fm-prod'
+        deploymentPool: 'PRODUCTION_SERVER'
+        logEnvironment: 'PRODUCTION'
+        conectorSAPName: "ConectorSAP_FM"
+        pipelineNumber: '763'
