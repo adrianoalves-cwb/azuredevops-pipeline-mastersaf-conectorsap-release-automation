@@ -1,0 +1,206 @@
+parameters:
+  sourceBranch: ""
+  deployment: ""
+  deploymentName: ""
+  deploymentEnvironment: ""
+  deploymentVariableGroup: ""
+  deploymentPool: ""
+  logEnvironment: ""
+  conectorSAPName: ""
+  pipelineNumber: ""
+
+jobs:
+- deployment: ${{ parameters.deployment }}
+  pool:
+    name: ${{ parameters.deploymentPool }}
+  displayName: ${{ parameters.deploymentName }}
+  environment: ${{ parameters.deploymentEnvironment }}
+  variables:
+   - group: ${{ parameters.deploymentVariableGroup }}
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+          - checkout: self
+
+          - script: |
+              echo "The pipeline was triggered by the branch: ${{ parameters.sourceBranch }} "
+            displayName: 'Show source branch'
+                
+          - task: ExtractFiles@1
+            displayName: Unzip the Installation file
+            inputs:
+              archiveFilePatterns: '$(Pipeline.Workspace)\drop\ConectorSAP.zip'
+              destinationFolder: '$(Build.ArtifactStagingDirectory)\ConectorSAP\'
+              cleanDestinationFolder: false
+              overwriteExistingFiles: true
+          
+          - task: PowerShell@2
+            displayName: 'Stop Windows Service'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Stop-Service $(ServiceName) -ErrorAction SilentlyContinue
+
+          - task: PowerShell@2
+            name: CleanupBackupFiles
+            env:
+              BACKUP_FOLDER_DIRECTORY: $(backupFolderDirectory)
+            inputs:
+              targetType: 'filePath'
+              filePath: '$(System.DefaultWorkingDirectory)\scripts\CleanupBackupFiles.ps1'
+
+          - task: PowerShell@2
+            name: CreateBackup
+            displayName: 
+            env:
+              CONECTOR_SAP_NAME: $(conectorSAPName)
+              SERVICE_NAME: ${{ parameters.serviceName }}
+              CONECTOR_SAP_INSTALLATION_DIRECTORY: $(conectorSAPInstallationDirectory)
+              BACKUP_FOLDER_DIRECTORY: $(backupFolderDirectory)
+            inputs:
+              targetType: 'filePath'
+              filePath: '$(System.DefaultWorkingDirectory)\scripts\CreateBackup.ps1'
+
+          - task: CopyFiles@2
+            displayName: 'Copy bin files'
+            inputs:
+              SourceFolder: '$(Build.ArtifactStagingDirectory)\ConectorSAP\bin'
+              TargetFolder: $(conectorSAPInstallationDirectory)\bin\
+              OverWrite: true
+
+          - task: CopyFiles@2
+            displayName: 'Copy dll files'
+            inputs:
+              SourceFolder: '$(Build.ArtifactStagingDirectory)\ConectorSAP\dll'
+              TargetFolder: $(conectorSAPInstallationDirectory)\dll\
+              OverWrite: true
+
+          - task: CopyFiles@2
+            displayName: 'Copy esapi files'
+            inputs:
+              SourceFolder: '$(Build.ArtifactStagingDirectory)\ConectorSAP\esapi'
+              TargetFolder: $(conectorSAPInstallationDirectory)\esapi\
+              OverWrite: true
+
+          - task: CopyFiles@2
+            displayName: 'Copy lib files'
+            inputs:
+              SourceFolder: '$(Build.ArtifactStagingDirectory)\ConectorSAP\lib'
+              TargetFolder: $(conectorSAPInstallationDirectory)\lib\
+              CleanTargetFolder: true
+              OverWrite: true
+
+          - task: PowerShell@2
+            displayName: "Deleting the jco *.trc log files"
+            inputs:
+              targetType: 'inline'
+              script: |
+                Remove-Item $(conectorSAPInstallationDirectory)\*.trc
+
+          - task: PowerShell@2
+            displayName: "Rename log file"
+            inputs:
+              targetType: 'inline'
+              script: |
+                $date = (Get-Date).ToString("ddMMyyyy.hhmmss")
+                $integradorLog = "integrador.0." + $date + ".log"
+                $conectorErpLog = "conector-erp." + $date + ".log"
+
+                Rename-Item $(conectorSAPInstallationDirectory)/logs/integrador.0.log -NewName $integradorLog
+                Rename-Item $(conectorSAPInstallationDirectory)/logs/conector-erp.log -NewName $conectorErpLog
+
+          - task: PowerShell@2
+            displayName: 'Start Windows Service'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Start-Service $(ServiceName)
+
+                Write-Host "Waiting 60 seconds"
+                Start-Sleep -Seconds 60 #Give time for Conector SAP start and create the log required for the next step
+
+                Write-Host "Resuming..."
+
+          - task: PowerShell@2
+            name: ValidateInstallation
+            env:
+              ENVIRONMENT: '${{ parameters.logEnvironment }}'
+              VERSION_TXT_PATH: $(Pipeline.Workspace)
+              CONECTORSAP_INSTALLATION_DIRECTORY: $(conectorSAPInstallationDirectory)
+            inputs:
+              targetType: 'filePath'
+              filePath: '$(System.DefaultWorkingDirectory)\scripts\ValidateInstallation.ps1'
+
+          - task: DeleteFiles@1
+            displayName: "Pipeline files cleanup"
+            condition: always()
+            inputs:
+              SourceFolder: "$(Agent.BuildDirectory)"
+              RemoveDotFiles: true
+              RemoveSourceFolder: false
+              Contents: |
+                a
+                b
+                s/**/*
+                TestResults
+
+#JOB = SEND EMAIL WITH SUCCESS OR FAILURE
+- job: Send_Email_Succeeded_ConectorSAP
+  dependsOn: 
+    - ${{ parameters.deployment }}
+  pool:
+    name: ${{ parameters.deploymentPool }}
+  variables:
+   - group: ${{ parameters.deploymentVariableGroup }}
+  condition: succeeded()
+  displayName: "Send Email Succeeded ConectorSAP"
+
+  steps:
+    - task: PowerShell@2
+      displayName: 'ConectorSAP Installation Version'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $conectorSAPversion = Get-Content -Path "$(Pipeline.Workspace)/BuildPipeline/drop/Version.txt"
+          Write-Host "ConectorSAP Version: " $conectorSAPversion
+
+          Write-Host "##vso[task.setvariable variable=version]$conectorSAPversion"
+
+    - task: PowerShell@2
+      name: Sending_Email_Succeeded 
+      env:
+        FROMEMAILADDRESS: $(FromEmailAddress)
+        TOEMAILADDRESS: $(ToEmailAddresses)
+        SMTPSERVER: $(SmtpServer)
+        VERSION: $(version)
+        STATUS: "Updated"
+        ENVIRONMENT: ${{ parameters.sourceBranch }}
+        CONECTOR_SAP_NAME: ${{ parameters.conectorSAPName }}
+      inputs:
+        targetType: 'filePath'
+        filePath: 'scripts/SendEmail.ps1'
+
+- job: Send_Email_Failed_ConectorSAP
+  dependsOn: 
+    - ${{ parameters.deployment }}
+  pool:
+    name: ${{ parameters.deploymentPool }}
+  variables:
+   - group: ${{ parameters.deploymentVariableGroup }}
+  condition: failed()
+  displayName: "Send Email Failed ConectorSAP"
+  steps:  
+    - task: PowerShell@2
+      name: Sending_Email
+      env:
+        FROMEMAILADDRESS: $(FromEmailAddress)
+        TOEMAILADDRESS: $(ToEmailAddresses)
+        SMTPSERVER: $(SmtpServer)
+        VERSION: $(version)
+        STATUS: "Failed"
+        ENVIRONMENT: ${{ parameters.sourceBranch }}
+        CONECTOR_SAP_NAME: ${{ parameters.conectorSAPName }}
+      inputs:
+        targetType: 'filePath'
+        filePath: 'scripts/SendEmail.ps1'

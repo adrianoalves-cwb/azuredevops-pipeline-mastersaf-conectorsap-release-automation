@@ -1,0 +1,1 @@
+Placeholder manifest for public repository sanitization. Replace with the private SAP manifest as needed.

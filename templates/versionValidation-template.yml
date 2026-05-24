@@ -1,0 +1,21 @@
+parameters:
+  branchName: ''
+
+steps:
+  - task: DownloadBuildArtifacts@1
+    inputs:
+      buildType: 'specific'
+      project: 'fb06773b-d9cd-4ba2-a472-45f39982cbac'
+      pipeline: '763'
+      buildVersionToDownload: 'latestFromBranch'
+      branchName: ${{ parameters.branchName }}
+      downloadType: 'specific'
+      downloadPath: '$(System.ArtifactsDirectory)'
+
+  - task: PowerShell@2
+    name: VersionValidation
+    env:
+        ARTIFACTSDIRECTORY: $(System.ArtifactsDirectory)
+    inputs:
+      targetType: 'filePath'
+      filePath: 'scripts/ValidateMastersafVersion.ps1'
